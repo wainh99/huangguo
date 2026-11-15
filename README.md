@@ -37,6 +37,17 @@ PORT=18081 node server.js
 | `GET/POST /api/up/*`, `/api/edge/*`, `/api/*` | Proxy to `https://huangguoai.com` (GET forwards the query string; POST does not, as in the original) |
 | `OPTIONS *` | 204 with CORS headers |
 
+## Cloud favorites (1.2.1.0)
+
+Favorites sync to Cloudflare KV through the huangguo-parser Worker
+(`https://huangguo-parser.wainh99.workers.dev/api/favs`, namespace
+huangguo-favs). The browser keeps localStorage as a cache; on load it
+pulls the cloud list, and every favorite toggle pushes the whole list
+(600 ms debounce). Set the `FAV_CODE` env var on each deployment to
+enable it (the code is the key to this station's list — never commit
+it). Without `FAV_CODE`, `/api/favs` answers 501 and the frontend
+falls back to local-only favorites.
+
 All responses carry `Access-Control-Allow-Origin: *`,
 `Access-Control-Allow-Headers: Content-Type, x-cdn-auth`,
 `Access-Control-Allow-Methods: GET, POST, OPTIONS`.

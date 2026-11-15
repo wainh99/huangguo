@@ -22,6 +22,8 @@
  *   GET  /proxy                 -> same relay (alias)
  *   GET  /proxy/img             -> cover fetch + AES-128-CBC decrypt
  *   GET  /api/prefip            -> cf.090227.xyz preferred-IP lists
+ *   GET  /api/favs             -> Cloudflare KV favorites (FAV_CODE env)
+ *   PUT  /api/favs             -> same, whole-list write
  *   GET  /api/up/*              -> proxy to https://huangguoai.com/api/*
  *   GET  /api/edge/*, /api/*    -> proxy to https://huangguoai.com (+ path)
  *   POST /api/up/*, /api/edge/*, /api/* (not /api/play) -> same, upstream
@@ -47,6 +49,14 @@ const path = require('node:path');
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = parseInt(process.env.PORT || '8081', 10);
 const UPSTREAM = 'https://huangguoai.com';
+
+// Cloud favorites: reuse the huangguo-parser Worker + huangguo-favs KV
+// (the same backend as the Huangguo station, a different code => a
+// different key, so the two stations never share a list).
+// The code IS the key to this station's favorites: keep it in the
+// FAV_CODE env var, never in the repo. Unset => local-only (501).
+const FAV_WORKER = 'https://huangguo-parser.wainh99.workers.dev';
+const FAV_CODE = (process.env.FAV_CODE || '').trim().toUpperCase();
 const USER_AGENT =
   'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36';
 
@@ -444,6 +454,33 @@ async function handleProxyImg(res, req, url) {
   send(res, req, 200, result.body, ctype);
 }
 
+// GET /api/favs, PUT /api/favs, POST /api/favs — forward to the
+// favorites Worker. The code is added server-side and never leaves the
+// server; the Worker validates the code and the list shape, and we pass
+// its status/body through unchanged.
+async function handleFavs(res, req, rawBody) {
+  if (!FAV_CODE) {
+    sendJson(res, req, 501, { status: 0, msg: 'favs not configured' });
+    return;
+  }
+  const method = req.method === 'GET' ? 'GET' : req.method; // PUT or POST
+  const url = `${FAV_WORKER}/api/favs?code=${encodeURIComponent(FAV_CODE)}`;
+  let result;
+  try {
+    result = await fetchUpstream(url, {
+      method,
+      data: method === 'GET' ? null : rawBody,
+      headers: method === 'GET' ? {} : { 'Content-Type': 'application/json' },
+      timeout: 15000,
+      errorContentType: 'from-headers',
+    });
+  } catch (e) {
+    sendJson(res, req, 502, { status: 0, msg: `favs upstream error: ${e.message}` });
+    return;
+  }
+  send(res, req, result.status, result.body, result.contentType || 'application/json');
+}
+
 // ---------------------------------------------------------------- routing
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -531,6 +568,12 @@ async function handle(req, res) {
       }
       return;
     }
+    // Cloud favorites — must come before the generic /api/* proxy below,
+    // or the request would be forwarded to the upstream site instead.
+    if (pathname === '/api/favs') {
+      await handleFavs(res, req, null);
+      return;
+    }
     if (pathname.startsWith('/api/up/')) {
       const rest = pathname.slice('/api/up/'.length);
       await proxyTo(res, req, `${UPSTREAM}/api/${rest}${query}`);
@@ -552,6 +595,11 @@ async function handle(req, res) {
     const body = await readBody(req);
     if (pathname === '/api/play') {
       await handleApiPlay(res, req, body);
+      return;
+    }
+    // Cloud favorites — same intercept as the GET route above.
+    if (pathname === '/api/favs') {
+      await handleFavs(res, req, body);
       return;
     }
     if (pathname.startsWith('/api/up/')) {
@@ -577,6 +625,16 @@ async function handle(req, res) {
     }
     sendJson(res, req, 404, { status: 0, msg: 'not found' });
     return;
+  }
+
+  // PUT only exists for /api/favs (cloud favorites); anything else keeps
+  // the Python 501 behaviour below.
+  if (req.method === 'PUT') {
+    const body = await readBody(req);
+    if (pathname === '/api/favs') {
+      await handleFavs(res, req, body);
+      return;
+    }
   }
 
   // Python's BaseHTTPRequestHandler answers 501 for other methods (HEAD,
