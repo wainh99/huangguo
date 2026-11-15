@@ -259,7 +259,7 @@ body[data-view="home"] footer{display:none}
   <button type="button" data-view="rank" onclick="showView('rank')"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 4h10v5a5 5 0 0 1-10 0V4z"/><path d="M7 5.5H4.8a2.7 2.7 0 0 0 2.7 4.6"/><path d="M17 5.5h2.2a2.7 2.7 0 0 1-2.7 4.6"/><path d="M12 14v3.5"/><path d="M8.5 20.5h7"/></svg></span>榜单</button>
 <!-- 1.2.0.8：底部导航删掉“帖子”，只剩 首页/分类/榜单/我的 4 项 -->  <button type="button" data-view="me" onclick="showView('me')"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="7.5" r="3.8"/><path d="M4.8 20.5a7.2 7.2 0 0 1 14.4 0"/></svg></span>我的</button>
 </nav>
-<footer>HGhub · 短剧 · 复刻版 1.2.1.0 · 手机首页 4 列小图 · 详情小图右文 · 看全集移右 · 播放页选集 · 全部 3361 部无限滚动 · 每 10 分钟自动检查更新 · 收藏云端同步</footer>
+<footer>HGhub · 短剧 · 复刻版 1.2.2.0 · 手机首页 4 列小图 · 详情小图右文 · 看全集移右 · 播放页选集 · 全部 3361 部无限滚动 · 每 10 分钟自动检查更新 · 收藏历史存 Redis</footer>
 <div class="modal" id="player" hidden>
   <div class="box">
     <button class="close" id="btnClosePlayer"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
@@ -377,7 +377,7 @@ if (typeof window !== 'undefined' && !window._alignShareBound){
   window._alignShareBound = true;
   window.addEventListener('resize', function(){ setTimeout(alignShare, 120); });
 }
-var APP_VERSION = '1.2.1.0';
+var APP_VERSION = '1.2.2.0';
 var SHARE_BASE = 'https://sp1.45678.eu.org/';
 /* 1.2.0.6：分享面板里的“下载 App”地址。发新版时只改这一处常量 + 各处版本号。 */
 var APK_RELEASE_URL = 'https://github.com/vps1986/hghub-clone/releases/download/v1.2.0.8/HGhub-1.2.0.8.apk';
@@ -553,22 +553,24 @@ function toggleFav(v){
   $$('[data-favcount="' + v.id + '"]').forEach(function(s){ s.textContent = fmtN(base + (isFav(v.id) ? 1 : 0)); }); /* 1.2.0.8+：收藏计数只留纯数字，不再重画一个星星图标 */
   if (!$('#view-me').hidden) renderMe();
 }
-/* 1.2.1.0：收藏同步到云端（Cloudflare KV，经本站 /api/favs 转发到
-   huangguo-parser Worker；同步码只存在服务端环境变量，不进前端和仓库）。
+/* 1.2.1.0：收藏同步到云端；1.2.2.0 改存 Hostless Valkey（本站 /api/favs，
+   服务端直连 REDIS_URL；浏览记录同款接口 /api/history）。
    本机 localStorage 是缓存，云端是真身：启动时拉一次云端（云端有就覆盖
-   本机、云端空而本机有就把本机推上去），点收藏/取消/清空后 600ms 内推
-   送整表。服务端没配 FAV_CODE 时 /api/favs 返回 501，前端只显示
-   “云端未配置”，收藏照常用本机版，不报错、不卡住。 */
+   本机、云端空而本机有就把本机推上去），点收藏/取消/清空、打开剧集后
+   600ms 内推送整表。服务端没配 REDIS_URL 时接口返回 501，前端只显示
+   “云端未配置”，收藏/历史照常用本机版，不报错、不卡住。 */
 var favCloud = { configured: true, syncing: false, pushTimer: null, status: '' };
+var histCloud = { syncing: false, pushTimer: null };
 function favToCloud(v){
-  return { vod_id: String(v.id), vod_name: v.title || '', vod_pic: v.cover || '', vod_remarks: '', savedAt: Date.now() };
+  return { id: v.id, title: v.title || '', cover: v.cover || '', savedAt: Date.now() };
 }
 function favFromCloud(x){
-  return { id: +x.vod_id, title: x.vod_name || '', cover: x.vod_pic || '' };
+  return { id: +x.id, title: x.title || '', cover: x.cover || '' };
 }
 function setFavSyncStatus(t){
   favCloud.status = t || '';
   $$('[data-fav-sync]').forEach(function(el){ el.textContent = favCloud.status; });
+  $$('[data-hist-sync]').forEach(function(el){ el.textContent = favCloud.status; });
 }
 function favFetch(url, opts){
   if (typeof AbortController === 'undefined') return fetch(url, opts);
@@ -586,7 +588,7 @@ async function pullFavs(){
     if (r.status === 501){ favCloud.configured = false; setFavSyncStatus('云端未配置，仅保存在本机'); return false; }
     if (!r.ok){ setFavSyncStatus('同步失败，仅保存在本机'); return false; }
     var d = await r.json();
-    if (d.source !== 'favs'){ favCloud.configured = false; setFavSyncStatus('云端未配置，仅保存在本机'); return false; }
+    if (d.source !== 'redis'){ favCloud.configured = false; setFavSyncStatus('云端未配置，仅保存在本机'); return false; }
     var server = (Array.isArray(d.list) ? d.list : []).map(favFromCloud).filter(function(x){ return x.id; });
     var local = store.get('hg_fav', []);
     if (server.length){
@@ -604,11 +606,11 @@ async function pullFavs(){
         });
         if (!$('#view-me').hidden) renderMe();
       }
-      setFavSyncStatus('已同步到云端');
+      setFavSyncStatus('已同步到 Redis');
       return true;
     }
     if (local.length){ await pushFavs(); return true; }
-    setFavSyncStatus('已同步到云端');
+    setFavSyncStatus('已同步到 Redis');
     return true;
   } catch(e){
     setFavSyncStatus('同步失败，仅保存在本机');
@@ -622,8 +624,8 @@ async function pushFavs(){
     if (r.status === 501){ favCloud.configured = false; setFavSyncStatus('云端未配置，仅保存在本机'); return false; }
     if (!r.ok){ setFavSyncStatus('同步失败，仅保存在本机'); return false; }
     var d = await r.json();
-    if (d.source !== 'favs' || !d.ok){ favCloud.configured = false; setFavSyncStatus('云端未配置，仅保存在本机'); return false; }
-    setFavSyncStatus('已同步到云端');
+    if (d.source !== 'redis' || !d.ok){ favCloud.configured = false; setFavSyncStatus('云端未配置，仅保存在本机'); return false; }
+    setFavSyncStatus('已同步到 Redis');
     return true;
   } catch(e){
     setFavSyncStatus('同步失败，仅保存在本机');
@@ -635,10 +637,66 @@ function schedulePushFav(){
   if (favCloud.pushTimer) clearTimeout(favCloud.pushTimer);
   favCloud.pushTimer = setTimeout(function(){ pushFavs(); }, 600);
 }
+/* 1.2.2.0：浏览记录也同步到云端（与收藏同一套接口，键不同：
+   /api/history，服务端键 hghub:history）。 */
+function histToCloud(h){
+  return { id: h.id, title: h.title || '', cover: h.cover || '', ep: h.ep || 1, t: h.t || Date.now() };
+}
+function histFromCloud(x){
+  return { id: +x.id, title: x.title || '', cover: x.cover || '', ep: x.ep || 1, t: x.t || 0 };
+}
+async function pullHistory(){
+  if (!favCloud.configured || histCloud.syncing) return false;
+  histCloud.syncing = true;
+  try {
+    var r = await favFetch('/api/history');
+    if (r.status === 501){ favCloud.configured = false; setFavSyncStatus('云端未配置，仅保存在本机'); return false; }
+    if (!r.ok){ setFavSyncStatus('同步失败，仅保存在本机'); return false; }
+    var d = await r.json();
+    if (d.source !== 'redis'){ favCloud.configured = false; setFavSyncStatus('云端未配置，仅保存在本机'); return false; }
+    var server = (Array.isArray(d.list) ? d.list : []).map(histFromCloud).filter(function(x){ return x.id; });
+    var local = store.get('hg_history', []);
+    if (server.length){
+      if (JSON.stringify(server) !== JSON.stringify(local)){
+        store.set('hg_history', server.slice(0, 50));
+        if (!$('#view-me').hidden) renderMe();
+      }
+      setFavSyncStatus('已同步到 Redis');
+      return true;
+    }
+    if (local.length){ await pushHistory(); return true; }
+    setFavSyncStatus('已同步到 Redis');
+    return true;
+  } catch(e){
+    setFavSyncStatus('同步失败，仅保存在本机');
+    return false;
+  } finally { histCloud.syncing = false; }
+}
+async function pushHistory(){
+  if (!favCloud.configured) return false;
+  try {
+    var r = await favFetch('/api/history', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ list: store.get('hg_history', []).map(histToCloud) }) });
+    if (r.status === 501){ favCloud.configured = false; setFavSyncStatus('云端未配置，仅保存在本机'); return false; }
+    if (!r.ok){ setFavSyncStatus('同步失败，仅保存在本机'); return false; }
+    var d = await r.json();
+    if (d.source !== 'redis' || !d.ok){ favCloud.configured = false; setFavSyncStatus('云端未配置，仅保存在本机'); return false; }
+    setFavSyncStatus('已同步到 Redis');
+    return true;
+  } catch(e){
+    setFavSyncStatus('同步失败，仅保存在本机');
+    return false;
+  }
+}
+function schedulePushHist(){
+  if (!favCloud.configured) return;
+  if (histCloud.pushTimer) clearTimeout(histCloud.pushTimer);
+  histCloud.pushTimer = setTimeout(function(){ pushHistory(); }, 600);
+}
 function addHistory(v, ep){
   var h = store.get('hg_history', []).filter(function(x){ return x.id !== v.id; });
   h.unshift({id: v.id, title: v.title, cover: v.cover, ep: ep || 1, t: Date.now()});
   store.set('hg_history', h.slice(0, 50));
+  schedulePushHist();
 }
 function slideHtml(v, i){
   var liked = isLiked(v.id), fav = isFav(v.id);
@@ -1550,6 +1608,7 @@ function renderMe(){
     '<p class="hint" data-fav-sync>' + esc(favCloud.status || '正在同步…') + '</p>' +
     (fav.length ? '<div class="grid">' + fav.map(function(v){ return cardHtml(v); }).join('') + '</div>' : '<p class="hint">还没有收藏</p>') + '</div>';
   html += '<div class="mebox"><h3>观看历史（' + hist.length + '）</h3>' +
+    '<p class="hint" data-hist-sync>' + esc(favCloud.status || '正在同步…') + '</p>' +
     (hist.length ? hist.map(function(h){
       return '<div class="rankrow" data-id="' + h.id + '">' + coverImg(h.cover, '', h.title) + '<div><h4>' + esc(h.title || '') + '</h4><p>看到第 ' + (h.ep || 1) + ' 集 · ' + new Date(h.t).toLocaleString() + '</p></div></div>';
     }).join('') : '<p class="hint">还没有观看记录</p>') + '</div>';
@@ -1563,7 +1622,7 @@ function renderMe(){
     '<div class="rowbtns"><button class="btn ghost" id="btnCopyPrefIp">复制优选 IP</button><button class="btn ghost" id="btnRefreshPrefIp">重新测优选 IP</button></div>' +
     '<p class="hint">列表来自 cf.090227.xyz（别人测好的优选 IP）。App 里开启后走优选 IP 加载页面；纯网页打开时仍走 Cloudflare 默认节点。</p>' +
     '<div class="rowbtns"><button class="btn ghost" id="btnClearHist">清空观看历史</button><button class="btn ghost" id="btnClearFav">清空收藏</button></div>' +
-    '<p class="hint">HGhub 复刻版 1.2.1.0 · 手机首页 4 列小图 · 详情小图右文 · 看全集移右 · 播放页选集 · 全部内容无限滚动（首页 3361 部）· 评论/分享 · 每 10 分钟自动检查更新 · 详情每次打开重新拉最新集数 · 收藏同步云端</p></div>';
+    '<p class="hint">HGhub 复刻版 1.2.2.0 · 手机首页 4 列小图 · 详情小图右文 · 看全集移右 · 播放页选集 · 全部内容无限滚动（首页 3361 部）· 评论/分享 · 每 10 分钟自动检查更新 · 详情每次打开重新拉最新集数 · 收藏历史存 Redis</p></div>';
   box.innerHTML = html;
   bindClicks(box);
   var bl = $('#btnLogin');
@@ -1599,7 +1658,7 @@ function renderMe(){
   if (pRef) pRef.onclick = function(){ loadPrefIp(true); };
   loadPrefIp();
   var ch = $('#btnClearHist');
-  if (ch) ch.onclick = function(){ store.set('hg_history', []); toast('已清空观看历史'); renderMe(); };
+  if (ch) ch.onclick = function(){ store.set('hg_history', []); schedulePushHist(); toast('已清空观看历史'); renderMe(); };
   var cf = $('#btnClearFav');
   if (cf) cf.onclick = function(){ store.set('hg_fav', []); schedulePushFav(); toast('已清空收藏'); renderMe(); };
 }
@@ -1719,6 +1778,7 @@ $('#btnLogoHome').onclick = goHome;
 loadHotTags();
 loadHome();
 pullFavs();
+pullHistory();
 handleDeepLink();
 </script>
 </body>

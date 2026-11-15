@@ -22,8 +22,10 @@
  *   GET  /proxy                 -> same relay (alias)
  *   GET  /proxy/img             -> cover fetch + AES-128-CBC decrypt
  *   GET  /api/prefip            -> cf.090227.xyz preferred-IP lists
- *   GET  /api/favs             -> Cloudflare KV favorites (FAV_CODE env)
+ *   GET  /api/favs             -> Valkey favorites (REDIS_URL env)
  *   PUT  /api/favs             -> same, whole-list write
+ *   GET  /api/history          -> Valkey watch history (REDIS_URL env)
+ *   PUT  /api/history          -> same, whole-list write
  *   GET  /api/up/*              -> proxy to https://huangguoai.com/api/*
  *   GET  /api/edge/*, /api/*    -> proxy to https://huangguoai.com (+ path)
  *   POST /api/up/*, /api/edge/*, /api/* (not /api/play) -> same, upstream
@@ -42,6 +44,8 @@
 'use strict';
 
 const http = require('node:http');
+const net = require('node:net');
+const tls = require('node:tls');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -50,13 +54,14 @@ const HOST = process.env.HOST || '0.0.0.0';
 const PORT = parseInt(process.env.PORT || '8081', 10);
 const UPSTREAM = 'https://huangguoai.com';
 
-// Cloud favorites: reuse the huangguo-parser Worker + huangguo-favs KV
-// (the same backend as the Huangguo station, a different code => a
-// different key, so the two stations never share a list).
-// The code IS the key to this station's favorites: keep it in the
-// FAV_CODE env var, never in the repo. Unset => local-only (501).
-const FAV_WORKER = 'https://huangguo-parser.wainh99.workers.dev';
-const FAV_CODE = (process.env.FAV_CODE || '').trim().toUpperCase();
+// Cloud favorites + watch history: Hostless Valkey (Redis protocol).
+// One REDIS_URL env var (rediss://user:pass@host:port/db), never in the
+// repo. Unset => local-only (501). Keys hold whole JSON lists:
+//   hghub:favs     [{id, title, cover, savedAt}]
+//   hghub:history  [{id, title, cover, ep, t}]
+const REDIS_URL = (process.env.REDIS_URL || '').trim();
+const FAVS_KEY = 'hghub:favs';
+const HIST_KEY = 'hghub:history';
 const USER_AGENT =
   'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36';
 
@@ -454,31 +459,230 @@ async function handleProxyImg(res, req, url) {
   send(res, req, 200, result.body, ctype);
 }
 
-// GET /api/favs, PUT /api/favs, POST /api/favs — forward to the
-// favorites Worker. The code is added server-side and never leaves the
-// server; the Worker validates the code and the list shape, and we pass
-// its status/body through unchanged.
-async function handleFavs(res, req, rawBody) {
-  if (!FAV_CODE) {
-    sendJson(res, req, 501, { status: 0, msg: 'favs not configured' });
-    return;
+// ---------------------------------------------------------------- valkey
+// Minimal RESP client over node:net / node:tls — no dependencies.
+// One short connection per call (AUTH, SELECT if needed, one command),
+// closed right after the reply. Favorites/history calls are rare, so
+// the handshake cost does not matter; short connections also survive
+// platform restarts without reconnect logic.
+function parseRedisUrl(u) {
+  const p = new URL(u);
+  if (p.protocol !== 'rediss:' && p.protocol !== 'redis:') {
+    throw new Error('REDIS_URL must start with redis:// or rediss://');
   }
-  const method = req.method === 'GET' ? 'GET' : req.method; // PUT or POST
-  const url = `${FAV_WORKER}/api/favs?code=${encodeURIComponent(FAV_CODE)}`;
-  let result;
-  try {
-    result = await fetchUpstream(url, {
-      method,
-      data: method === 'GET' ? null : rawBody,
-      headers: method === 'GET' ? {} : { 'Content-Type': 'application/json' },
-      timeout: 15000,
-      errorContentType: 'from-headers',
+  return {
+    host: p.hostname,
+    port: parseInt(p.port || (p.protocol === 'rediss:' ? '6380' : '6379'), 10),
+    tls: p.protocol === 'rediss:',
+    user: decodeURIComponent(p.username || ''),
+    pass: decodeURIComponent(p.password || ''),
+    db: parseInt((p.pathname || '/0').replace(/^\//, '') || '0', 10) || 0,
+  };
+}
+
+function encodeResp(args) {
+  const parts = [Buffer.from('*' + args.length + '\r\n', 'utf8')];
+  for (const a of args) {
+    const b = Buffer.from(String(a), 'utf8');
+    parts.push(Buffer.from('$' + b.length + '\r\n', 'utf8'), b, Buffer.from('\r\n', 'utf8'));
+  }
+  return Buffer.concat(parts);
+}
+
+// Parse one RESP reply from buf starting at off.
+// Returns [value, nextOff], or null when the buffer does not hold a
+// complete reply yet. Error replies (-...) throw.
+function parseResp(buf, off) {
+  const type = String.fromCharCode(buf[off]);
+  const end = buf.indexOf('\r\n', off);
+  if (end === -1) return null;
+  const line = buf.toString('utf8', off + 1, end);
+  if (type === '+') return [line, end + 2];
+  if (type === '-') throw new Error('redis error: ' + line);
+  if (type === ':') return [parseInt(line, 10), end + 2];
+  if (type === '$') {
+    const len = parseInt(line, 10);
+    if (len === -1) return [null, end + 2];
+    if (buf.length < end + 2 + len + 2) return null;
+    return [buf.toString('utf8', end + 2, end + 2 + len), end + 2 + len + 2];
+  }
+  if (type === '*') {
+    const n = parseInt(line, 10);
+    if (n === -1) return [null, end + 2];
+    const out = [];
+    let cur = end + 2;
+    for (let i = 0; i < n; i++) {
+      const r = parseResp(buf, cur);
+      if (r === null) return null;
+      out.push(r[0]);
+      cur = r[1];
+    }
+    return [out, cur];
+  }
+  throw new Error('redis: unknown reply type ' + JSON.stringify(type));
+}
+
+function redisCall(args) {
+  return redisAttempt(args, 0);
+}
+
+// One attempt: open a TLS/plain connection, AUTH, SELECT if needed, run
+// one command, close. Transient transport failures (timeout, reset)
+// get one retry 300 ms later — the first connections after a cold
+// start can be slow to establish; RESP error replies (wrong password
+// and friends) are real failures and are not retried. GET/SET here are
+// idempotent whole-list operations, so a retry cannot double-apply.
+function redisAttempt(args, attempt) {
+  return new Promise((resolve, reject) => {
+    let cfg;
+    try {
+      cfg = parseRedisUrl(REDIS_URL);
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    let done = false;
+    let sock = null;
+    let respError = null;
+    const timer = setTimeout(() => fail(new Error('redis timeout')), 8000);
+    const fail = (e) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try {
+        if (sock) sock.destroy();
+      } catch {}
+      if (respError === null && attempt < 1) {
+        setTimeout(() => {
+          redisAttempt(args, attempt + 1).then(resolve, reject);
+        }, 300);
+      } else {
+        reject(respError || e);
+      }
+    };
+    sock = cfg.tls
+      ? tls.connect({ host: cfg.host, port: cfg.port, servername: cfg.host })
+      : net.connect({ host: cfg.host, port: cfg.port });
+    let buf = Buffer.alloc(0);
+    const queue = [];
+    const send = (a) =>
+      new Promise((res) => {
+        queue.push(res);
+        sock.write(encodeResp(a), (e) => {
+          if (e) fail(e);
+        });
+      });
+    sock.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      while (queue.length) {
+        let parsed;
+        try {
+          parsed = parseResp(buf, 0);
+        } catch (e) {
+          respError = e;
+          fail(e);
+          return;
+        }
+        if (parsed === null) return; // wait for more data
+        buf = buf.subarray(parsed[1]);
+        queue.shift()(parsed[0]);
+      }
     });
-  } catch (e) {
-    sendJson(res, req, 502, { status: 0, msg: `favs upstream error: ${e.message}` });
+    sock.on('error', fail);
+    sock.on(cfg.tls ? 'secureConnect' : 'connect', async () => {
+      try {
+        if (cfg.user) await send(['AUTH', cfg.user, cfg.pass]);
+        else if (cfg.pass) await send(['AUTH', cfg.pass]);
+        if (cfg.db !== 0) await send(['SELECT', String(cfg.db)]);
+        const v = await send(args);
+        clearTimeout(timer);
+        done = true;
+        try {
+          sock.end();
+        } catch {}
+        resolve(v);
+      } catch (e) {
+        fail(e);
+      }
+    });
+  });
+}
+
+async function redisGet(key) {
+  const v = await redisCall(['GET', key]);
+  return v === null ? null : v;
+}
+
+async function redisSet(key, value) {
+  const v = await redisCall(['SET', key, value]);
+  if (v !== 'OK') throw new Error('redis SET failed: ' + String(v));
+}
+
+// GET /api/favs|/api/history, PUT|POST same — whole-list read/write.
+// GET returns {list, source:'redis'} (empty list when the key is absent).
+// PUT/POST takes {list:[...]} and returns {ok, count, source:'redis'}.
+// No REDIS_URL => 501 (frontend falls back to local-only). Redis errors
+// => 502 (frontend shows "同步失败，仅保存在本机").
+function cleanFavItem(x) {
+  if (!x || typeof x.id === 'undefined') return null;
+  const id = +x.id;
+  if (!id) return null;
+  return {
+    id,
+    title: String(x.title || '').slice(0, 200),
+    cover: String(x.cover || '').slice(0, 2000),
+    savedAt: Number(x.savedAt) || Date.now(),
+  };
+}
+function cleanHistItem(x) {
+  if (!x || typeof x.id === 'undefined') return null;
+  const id = +x.id;
+  if (!id) return null;
+  return {
+    id,
+    title: String(x.title || '').slice(0, 200),
+    cover: String(x.cover || '').slice(0, 2000),
+    ep: Math.max(1, +x.ep || 1),
+    t: Number(x.t) || Date.now(),
+  };
+}
+async function handleStore(res, req, rawBody, key, maxItems, clean) {
+  if (!REDIS_URL) {
+    sendJson(res, req, 501, { status: 0, msg: 'cloud storage not configured' });
     return;
   }
-  send(res, req, result.status, result.body, result.contentType || 'application/json');
+  try {
+    if (req.method === 'GET') {
+      const raw = await redisGet(key);
+      let list = [];
+      if (raw) {
+        try {
+          const d = JSON.parse(raw);
+          list = (Array.isArray(d) ? d : []).map(clean).filter(Boolean);
+        } catch {
+          list = [];
+        }
+      }
+      sendJson(res, req, 200, { list, source: 'redis' });
+      return;
+    }
+    let body;
+    try {
+      body = JSON.parse(rawBody.length ? rawBody.toString('utf8') : '{}');
+    } catch {
+      sendJson(res, req, 400, { status: 0, msg: 'bad json' });
+      return;
+    }
+    if (!body || !Array.isArray(body.list) || body.list.length > maxItems) {
+      sendJson(res, req, 400, { status: 0, msg: 'bad list' });
+      return;
+    }
+    const list = body.list.map(clean).filter(Boolean);
+    await redisSet(key, JSON.stringify(list));
+    sendJson(res, req, 200, { ok: true, count: list.length, source: 'redis' });
+  } catch (e) {
+    sendJson(res, req, 502, { status: 0, msg: `redis error: ${e.message}` });
+  }
 }
 
 // ---------------------------------------------------------------- routing
@@ -568,10 +772,14 @@ async function handle(req, res) {
       }
       return;
     }
-    // Cloud favorites — must come before the generic /api/* proxy below,
-    // or the request would be forwarded to the upstream site instead.
+    // Cloud favorites + history — must come before the generic /api/*
+    // proxy below, or the request would be forwarded upstream instead.
     if (pathname === '/api/favs') {
-      await handleFavs(res, req, null);
+      await handleStore(res, req, null, FAVS_KEY, 500, cleanFavItem);
+      return;
+    }
+    if (pathname === '/api/history') {
+      await handleStore(res, req, null, HIST_KEY, 100, cleanHistItem);
       return;
     }
     if (pathname.startsWith('/api/up/')) {
@@ -597,9 +805,13 @@ async function handle(req, res) {
       await handleApiPlay(res, req, body);
       return;
     }
-    // Cloud favorites — same intercept as the GET route above.
+    // Cloud favorites + history — same intercept as the GET route above.
     if (pathname === '/api/favs') {
-      await handleFavs(res, req, body);
+      await handleStore(res, req, body, FAVS_KEY, 500, cleanFavItem);
+      return;
+    }
+    if (pathname === '/api/history') {
+      await handleStore(res, req, body, HIST_KEY, 100, cleanHistItem);
       return;
     }
     if (pathname.startsWith('/api/up/')) {
@@ -627,12 +839,16 @@ async function handle(req, res) {
     return;
   }
 
-  // PUT only exists for /api/favs (cloud favorites); anything else keeps
-  // the Python 501 behaviour below.
+  // PUT only exists for /api/favs and /api/history (cloud favorites and
+  // history); anything else keeps the Python 501 behaviour below.
   if (req.method === 'PUT') {
     const body = await readBody(req);
     if (pathname === '/api/favs') {
-      await handleFavs(res, req, body);
+      await handleStore(res, req, body, FAVS_KEY, 500, cleanFavItem);
+      return;
+    }
+    if (pathname === '/api/history') {
+      await handleStore(res, req, body, HIST_KEY, 100, cleanHistItem);
       return;
     }
   }
