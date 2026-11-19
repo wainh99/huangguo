@@ -84,6 +84,7 @@ const IMG_HOSTS = new Set([
   'image.drleao.cn',
   'new2.drleao.cn',
   'pic.aluxvl.cn',
+  'pic.qnlycc.cn',
   'huangguoai.com',
 ]);
 
