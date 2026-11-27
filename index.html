@@ -565,7 +565,7 @@ function toggleFav(v){
    点收藏/取消/清空、打开剧集后
    600ms 内推送整表。服务端没配 REDIS_URL 时接口返回 501，前端只显示
    “云端未配置”，收藏/历史照常用本机版，不报错、不卡住。 */
-var favCloud = { configured: true, syncing: false, pushTimer: null, status: '' };
+var favCloud = { configured: false, syncing: false, pushTimer: null, status: '' }; /* local-only build: favorites and history stay in this browser's localStorage, never touch the cloud */
 var histCloud = { syncing: false, pushTimer: null };
 function favToCloud(v){
   return { id: v.id, title: v.title || '', cover: v.cover || '', episode_count: v.episode_count || v.total_episodes || '', collect_count: v.collect_count || '', savedAt: Date.now() };
@@ -1846,6 +1846,7 @@ function goHome(){
 $('#btnLogoHome').onclick = goHome;
 loadHotTags();
 loadHome();
+setFavSyncStatus('仅保存在本机');
 pullFavs();
 pullHistory();
 handleDeepLink();
