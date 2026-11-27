@@ -49,6 +49,10 @@ every favorite toggle or video open pushes the whole list (600 ms
 debounce). Without `REDIS_URL`, `/api/favs` and `/api/history` answer
 501 and the frontend falls back to local-only data.
 
+## Two versions
+- `main` — shared-favorites build: set `REDIS_URL` and favorites/history sync across devices via Valkey (this is the build running on 137/129/MS HOST).
+- `local-favs` branch — local-only build: favorites and history live only in the browser's localStorage, no Redis, no cloud sync. Same playback, same allowlist, same playlist rewrite.
+
 All responses carry `Access-Control-Allow-Origin: *`,
 `Access-Control-Allow-Headers: Content-Type, x-cdn-auth`,
 `Access-Control-Allow-Methods: GET, POST, OPTIONS`.
