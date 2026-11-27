@@ -330,7 +330,19 @@ async function handleProxyRelay(res, req, url) {
   } else if (urlPath.endsWith('.key') || url.includes('crypt.key')) {
     ctype = 'application/octet-stream';
   }
-  send(res, req, result.status, result.body, ctype);
+    // Rewrite .m3u8 playlists so the browser never fetches KEY/segments
+  // directly from the video CDN: cross-origin fetches carry an Origin
+  // header and the CDN answers 403 (keyLoadError / endless buffering).
+  // Route them through this proxy instead, like m3u8proxy does for hh.
+  let outBody = result.body;
+  if (ctype === 'application/vnd.apple.mpegurl' && result.status === 200) {
+    const text = outBody.toString('utf8');
+    const rewritten = text
+      .replace(/(#EXT-X-KEY:[^\n]*URI=")([^"]+)(")/g, (m, a, u, b) => a + '/proxy/key?url=' + encodeURIComponent(u) + b)
+      .replace(/^(https?:\/\/\S+\.ts(\?\S*)?)$/gm, (m) => '/proxy/ts?url=' + encodeURIComponent(m));
+    outBody = Buffer.from(rewritten, 'utf8');
+  }
+send(res, req, result.status, outBody, ctype);
 }
 
 // POST /api/play — upstream playback with an EMPTY JSON body. Any id/ep in
