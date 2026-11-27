@@ -75,7 +75,7 @@ const ALLOWED_HOSTS = new Set([
   'tp4.drleao.cn',
   'tp8.drleao.cn',
 ]);
-const ALLOWED_SUFFIXES = ['.hzjvlo.cn', '.drleao.cn'];
+const ALLOWED_SUFFIXES = ['.hzjvlo.cn', '.drleao.cn', '.tjyyjk.cn', '.qnlycc.cn'];
 
 // /proxy/img only allows these image hosts (web/server.py).
 const IMG_HOSTS = new Set([
