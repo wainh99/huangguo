@@ -560,8 +560,9 @@ function toggleFav(v){
 }
 /* 1.2.1.0：收藏同步到云端；1.2.2.0 改存 Hostless Valkey（本站 /api/favs，
    服务端直连 REDIS_URL；浏览记录同款接口 /api/history）。
-   本机 localStorage 是缓存，云端是真身：启动时拉一次云端（云端有就覆盖
-   本机、云端空而本机有就把本机推上去），点收藏/取消/清空、打开剧集后
+   本机 localStorage 与云端双向合并（1.2.2.2）：启动时拉一次云端，按上次同步快照
+   三路合并——两边并集，谁都不丢；删了的不复活；云端缺了本机有的就推回去补全。
+   点收藏/取消/清空、打开剧集后
    600ms 内推送整表。服务端没配 REDIS_URL 时接口返回 501，前端只显示
    “云端未配置”，收藏/历史照常用本机版，不报错、不卡住。 */
 var favCloud = { configured: true, syncing: false, pushTimer: null, status: '' };
@@ -571,6 +572,35 @@ function favToCloud(v){
 }
 function favFromCloud(x){
   return { id: +x.id, title: x.title || '', cover: x.cover || '', episode_count: x.episode_count || x.total_episodes || '', collect_count: x.collect_count || '' };
+}
+/* 1.2.2.2：收藏/历史同步改“合并”不“覆盖”——云端 38 条、本机 61 条时，旧逻辑
+   拿云端整表覆盖本机，本机独有的收藏就丢了，播放页星星也不变色。按上次同步
+   快照三路合并：快照里有、本机没了 = 本机删了，不复活；快照里有、云端没了 =
+   别处删了，本机跟删；其余两边并集（字段按缺失互补，历史取最新 t）。
+   快照只在推送成功后更新（见 pushFavs/pushHistory），推送失败不更新，
+   下次拉取会重新合并，不会丢数据。 */
+function mergeSync(server, local, synced){
+  server = Array.isArray(server) ? server : [];
+  local = Array.isArray(local) ? local : [];
+  synced = Array.isArray(synced) ? synced : [];
+  var sIds = {}, lIds = {}, vIds = {}, content = {};
+  synced.forEach(function(x){ sIds[x.id] = true; });
+  local.forEach(function(x){ lIds[x.id] = true; });
+  server.forEach(function(x){ vIds[x.id] = true; });
+  function put(x){
+    var old = content[x.id];
+    if (!old){ content[x.id] = x; return; }
+    if (!old.title && x.title) old.title = x.title;
+    if (!old.cover && x.cover) old.cover = x.cover;
+    if (!old.episode_count && x.episode_count) old.episode_count = x.episode_count;
+    if (!old.collect_count && x.collect_count) old.collect_count = x.collect_count;
+    if (x.t && (!old.t || x.t > old.t)){ old.t = x.t; if (x.ep) old.ep = x.ep; }
+  }
+  server.forEach(put); local.forEach(put);
+  var out = [];
+  local.forEach(function(x){ if (sIds[x.id] && !vIds[x.id]) return; out.push(content[x.id]); });
+  server.forEach(function(x){ if (lIds[x.id]) return; if (sIds[x.id]) return; out.push(content[x.id]); });
+  return out;
 }
 function setFavSyncStatus(t){
   favCloud.status = t || '';
@@ -596,25 +626,22 @@ async function pullFavs(){
     if (d.source !== 'redis'){ favCloud.configured = false; setFavSyncStatus('云端未配置，仅保存在本机'); return false; }
     var server = (Array.isArray(d.list) ? d.list : []).map(favFromCloud).filter(function(x){ return x.id; });
     var local = store.get('hg_fav', []);
-    if (server.length){
-      if (JSON.stringify(server) !== JSON.stringify(local)){
-        store.set('hg_fav', server);
-        /* 云端覆盖本机后，把屏幕上所有收藏星星和计数刷成云端状态 */
-        $$('[data-fav]').forEach(function(b){
-          var id = +b.getAttribute('data-fav');
-          var fav = isFav(id);
-          b.innerHTML = ic('star', fav);
-          b.classList.toggle('faved', fav);
-          var v = findVideo(id);
-          var s = document.querySelector('[data-favcount="' + id + '"]');
-          if (v && s) s.textContent = fmtN((+v.collect_count || 0) + (fav ? 1 : 0));
-        });
-        if (!$('#view-me').hidden) renderMe();
-      }
-      setFavSyncStatus('已同步到 Redis');
-      return true;
+    var merged = mergeSync(server, local, store.get('hg_fav_synced', []));
+    if (JSON.stringify(merged) !== JSON.stringify(local)){
+      store.set('hg_fav', merged);
+      /* 合并后，把屏幕上所有收藏星星和计数刷成合并后的状态 */
+      $$('[data-fav]').forEach(function(b){
+        var id = +b.getAttribute('data-fav');
+        var fav = isFav(id);
+        b.innerHTML = ic('star', fav);
+        b.classList.toggle('faved', fav);
+        var v = findVideo(id);
+        var s = document.querySelector('[data-favcount="' + id + '"]');
+        if (v && s) s.textContent = fmtN((+v.collect_count || 0) + (fav ? 1 : 0));
+      });
+      if (!$('#view-me').hidden) renderMe();
     }
-    if (local.length){ await pushFavs(); return true; }
+    if (JSON.stringify(merged) !== JSON.stringify(server)) schedulePushFav(); /* 云端缺了本机有的，推回去补全 */
     setFavSyncStatus('已同步到 Redis');
     return true;
   } catch(e){
@@ -630,6 +657,7 @@ async function pushFavs(){
     if (!r.ok){ setFavSyncStatus('同步失败，仅保存在本机'); return false; }
     var d = await r.json();
     if (d.source !== 'redis' || !d.ok){ favCloud.configured = false; setFavSyncStatus('云端未配置，仅保存在本机'); return false; }
+    store.set('hg_fav_synced', store.get('hg_fav', [])); /* 推送成功才更新快照（mergeSync 的判断依据） */
     setFavSyncStatus('已同步到 Redis');
     return true;
   } catch(e){
@@ -661,15 +689,12 @@ async function pullHistory(){
     if (d.source !== 'redis'){ favCloud.configured = false; setFavSyncStatus('云端未配置，仅保存在本机'); return false; }
     var server = (Array.isArray(d.list) ? d.list : []).map(histFromCloud).filter(function(x){ return x.id; });
     var local = store.get('hg_history', []);
-    if (server.length){
-      if (JSON.stringify(server) !== JSON.stringify(local)){
-        store.set('hg_history', server.slice(0, 50));
-        if (!$('#view-me').hidden) renderMe();
-      }
-      setFavSyncStatus('已同步到 Redis');
-      return true;
+    var merged = mergeSync(server, local, store.get('hg_history_synced', [])).sort(function(a, b){ return (b.t || 0) - (a.t || 0); }).slice(0, 50);
+    if (JSON.stringify(merged) !== JSON.stringify(local)){
+      store.set('hg_history', merged);
+      if (!$('#view-me').hidden) renderMe();
     }
-    if (local.length){ await pushHistory(); return true; }
+    if (JSON.stringify(merged) !== JSON.stringify(server)) schedulePushHist(); /* 云端缺了本机有的，推回去补全 */
     setFavSyncStatus('已同步到 Redis');
     return true;
   } catch(e){
@@ -685,6 +710,7 @@ async function pushHistory(){
     if (!r.ok){ setFavSyncStatus('同步失败，仅保存在本机'); return false; }
     var d = await r.json();
     if (d.source !== 'redis' || !d.ok){ favCloud.configured = false; setFavSyncStatus('云端未配置，仅保存在本机'); return false; }
+    store.set('hg_history_synced', store.get('hg_history', [])); /* 推送成功才更新快照（mergeSync 的判断依据） */
     setFavSyncStatus('已同步到 Redis');
     return true;
   } catch(e){
