@@ -228,6 +228,7 @@ body[data-view="home"] footer{display:none}
   </section>
   <section id="view-cat" hidden>
     <div class="chips" id="catChips"><span class="hint">加载分类中...</span></div>
+    <div class="chips" id="catSortChips"><button class="chip on" data-sort="new">最新更新</button><button class="chip" data-sort="hot">当前热播</button><button class="chip" data-sort="original">独家原创</button><button class="chip" data-sort="random">随机推荐</button></div>
     <p class="hint" id="catTotal"></p>
     <div class="grid" id="catGrid"></div>
     <div id="catEnd" class="empty" hidden>已加载全部</div>
@@ -382,7 +383,7 @@ if (typeof window !== 'undefined' && !window._alignShareBound){
   window._alignShareBound = true;
   window.addEventListener('resize', function(){ setTimeout(alignShare, 120); });
 }
-var APP_VERSION = '1.2.2.1';
+var APP_VERSION = '1.2.2.3';
 var SHARE_BASE = 'https://sp1.45678.eu.org/';
 /* 1.2.0.6：分享面板里的“下载 App”地址。发新版时只改这一处常量 + 各处版本号。 */
 var APK_RELEASE_URL = 'https://github.com/vps1986/hghub-clone/releases/download/v1.2.0.8/HGhub-1.2.0.8.apk';
@@ -522,6 +523,7 @@ var feedState = {page: 0, pages: 1, total: 0, loading: false, done: false};
 var HOME_GRID = window.matchMedia('(max-width: 768px)').matches; /* 1.2.0.9：手机首页用 4 列小图网格（.card），不用抖音式全屏 feed；桌面不变 */
 var runToken = {home: 0, cat: 0, search: 0, post: 0, rank: 0};
 var catState = {cat: '', page: 0, pages: 1, total: 0, loading: false, done: false};
+var catSort = 'new'; /* 1.2.2.3：分类页排序——new 最新更新（上游 sort=new）、hot 当前热播（默认热度序）、original 独家原创（is_original=1 本机过滤）、random 随机推荐（跳随机页） */
 var searchState = {q: '', page: 0, pages: 1, total: 0, loading: false, done: false};
 var postState = {page: 0, pages: 1, total: 0, loading: false, done: false};
 function dedupeAppend(list, items){
@@ -531,9 +533,11 @@ function dedupeAppend(list, items){
   items.forEach(function(v){ if (!seen[v.id]){ seen[v.id] = true; list.push(v); added.push(v); } });
   return added;
 }
-function updateTotal(el, shown, total){
+function updateTotal(el, shown, total, page, pages){
   if (!el) return;
-  el.textContent = total ? ('全部 ' + total + ' 部 · 已加载 ' + shown + ' 部') : ('已加载 ' + shown + ' 部');
+  var t = total ? ('全部 ' + total + ' 部 · 已加载 ' + shown + ' 部') : ('已加载 ' + shown + ' 部');
+  if (page && pages) t += ' · 第 ' + page + '/' + pages + ' 页';
+  el.textContent = t;
 }
 function isLiked(id){ return !!store.get('hg_likes', {})[id]; }
 function isFav(id){ return store.get('hg_fav', []).some(function(x){ return x.id === id; }); }
@@ -1138,14 +1142,34 @@ async function loadCats(){
 /* 1.2.0.3 分类：上游参数是 cate_id（不是 category_id，后者会被忽略返回全量）。
    各分类实测：24 AI成人短剧 1518部/76页，25 AI成人漫剧 113部/6页，
    26 AI换脸 832部/42页，27 AI魔改 898部/45页。无限滚动加载全部。 */
-async function loadCatVideos(cat){
+async function loadCatVideos(cat, startPage){
   runToken.cat++;
   catState = {cat: cat || '', page: 0, pages: 1, total: 0, loading: false, done: false};
   catItems = [];
   var grid = $('#catGrid');
   grid.innerHTML = '<div class="empty">加载中...</div>';
   $('#catEnd').hidden = true;
+  if (startPage) catState.page = startPage - 1;
   await loadCatNext();
+}
+/* 1.2.2.3：分类页排序切换。new/hot 走上游 sort 参数（全局正确）；original 本机按
+   is_original 过滤；random 跳一随机页（已知总页数时），未知总页数时就地打乱已加载的。 */
+function applyCatSort(sort){
+  catSort = sort;
+  $$('#catSortChips .chip').forEach(function(x){ x.classList.toggle('on', x.getAttribute('data-sort') === sort); });
+  if (sort === 'random'){
+    if (catState.pages > 1) loadCatVideos(catState.cat, 1 + Math.floor(Math.random() * catState.pages));
+    else if (catItems.length) shuffleCat();
+    else loadCatVideos(catState.cat);
+  } else {
+    loadCatVideos(catState.cat);
+  }
+}
+function shuffleCat(){
+  for (var i = catItems.length - 1; i > 0; i--){ var j = Math.floor(Math.random() * (i + 1)); var t = catItems[i]; catItems[i] = catItems[j]; catItems[j] = t; }
+  var grid = $('#catGrid');
+  grid.innerHTML = catItems.map(cardHtml).join('') || '<div class="empty">该分类暂无内容</div>';
+  bindClicks(grid);
 }
 async function loadCatNext(){
   var grid = $('#catGrid');
@@ -1156,9 +1180,12 @@ async function loadCatNext(){
   try {
     var path = '/api/videos?page=' + nextPage;
     if (catState.cat) path += '&cate_id=' + encodeURIComponent(catState.cat);
+    if (catSort === 'new') path += '&sort=new';
+    else if (catSort === 'hot') path += '&sort=hot';
     var j = await api(path);
     if (myRun !== runToken.cat) return;
-    var items = itemsOf(j);
+    var rawItems = itemsOf(j);
+    var items = catSort === 'original' ? rawItems.filter(function(v){ return v.is_original === 1; }) : rawItems;
     var pg = pagOf(j);
     catState.page = pg.page; catState.pages = pg.pages; catState.total = pg.total;
     var added = dedupeAppend(catItems, items);
@@ -1166,11 +1193,11 @@ async function loadCatNext(){
     if (nextPage === 1) grid.innerHTML = html || '<div class="empty">该分类暂无内容</div>';
     else grid.insertAdjacentHTML('beforeend', html);
     bindClicks(grid);
-    if (catState.page >= catState.pages || !items.length){
+    if (catState.page >= catState.pages || !rawItems.length){
       catState.done = true;
       $('#catEnd').hidden = false;
     }
-    updateTotal($('#catTotal'), catItems.length, catState.total);
+    updateTotal($('#catTotal'), catItems.length, catState.total, catState.page, catState.pages);
   } catch(e){
     if (nextPage === 1) grid.innerHTML = '<div class="empty">加载失败：' + esc(e.message || e) + '</div>';
     else toast('加载下一页失败：' + (e.message || e));
@@ -1774,6 +1801,8 @@ document.addEventListener('click', function(e){
     loadCatVideos(cat.getAttribute('data-cat'));
     return;
   }
+  var sort = t.closest('#catSortChips [data-sort]');
+  if (sort){ applyCatSort(sort.getAttribute('data-sort')); return; }
   var rank = t.closest('#rankTabs .chip[data-type]');
   if (rank){
     $$('#rankTabs .chip').forEach(function(x){ x.classList.remove('on'); });
